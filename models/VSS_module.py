@@ -114,6 +114,104 @@ class CrossMerge(torch.autograd.Function):
         xs = xs.view(B, 4, C, H, W)
         return xs
     
+# def cross_selective_scan(
+#     x: torch.Tensor=None, 
+#     x_proj_weight: torch.Tensor=None,
+#     x_proj_bias: torch.Tensor=None,
+#     dt_projs_weight: torch.Tensor=None,
+#     dt_projs_bias: torch.Tensor=None,
+#     A_logs: torch.Tensor=None,
+#     Ds: torch.Tensor=None,
+#     delta_softplus = True,
+#     out_norm: torch.nn.Module=None,
+#     out_norm_shape="v0",
+#     to_dtype=True, # True: final out to dtype
+#     force_fp32=False, # True: input fp32
+#     nrows = -1, # for SelectiveScanNRow; 0: auto; -1: disable;
+#     backnrows = -1, # for SelectiveScanNRow; 0: auto; -1: disable;
+#     ssoflex=True, # True: out fp32 in SSOflex; else, SSOflex is the same as SSCore
+#     SelectiveScan=None,
+#     CrossScan=CrossScan,
+#     CrossMerge=CrossMerge,
+#     no_einsum=False, # replace einsum with linear or conv1d to raise throughput
+#     dt_low_rank=True,
+# ):
+#     # out_norm: whatever fits (B, L, C); LayerNorm; Sigmoid; Softmax(dim=1);...
+
+#     B, D, H, W = x.shape
+#     D, N = A_logs.shape
+#     K, D, R = dt_projs_weight.shape
+#     L = H * W
+
+#     if nrows == 0:
+#         if D % 4 == 0:
+#             nrows = 4
+#         elif D % 3 == 0:
+#             nrows = 3
+#         elif D % 2 == 0:
+#             nrows = 2
+#         else:
+#             nrows = 1
+        
+#     if backnrows == 0:
+#         if D % 4 == 0:
+#             backnrows = 4
+#         elif D % 3 == 0:
+#             backnrows = 3
+#         elif D % 2 == 0:
+#             backnrows = 2
+#         else:
+#             backnrows = 1
+
+#     def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True):
+#         return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows, backnrows, ssoflex)
+    
+#     if (not dt_low_rank):
+#         x_dbl = F.conv1d(x.view(B, -1, L), x_proj_weight.view(-1, D, 1), bias=(x_proj_bias.view(-1) if x_proj_bias is not None else None), groups=K)
+#         dts, Bs, Cs = torch.split(x_dbl.view(B, -1, L), [D, 4 * N, 4 * N], dim=1)
+#         xs = CrossScan.apply(x)
+#         dts = CrossScan.apply(dts)
+#     elif no_einsum:
+#         xs = CrossScan.apply(x)
+#         x_dbl = F.conv1d(xs.view(B, -1, L), x_proj_weight.view(-1, D, 1), bias=(x_proj_bias.view(-1) if x_proj_bias is not None else None), groups=K)
+#         dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
+#         dts = F.conv1d(dts.contiguous().view(B, -1, L), dt_projs_weight.view(K * D, -1, 1), groups=K)
+#     else:
+#         xs = CrossScan.apply(x)
+#         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, x_proj_weight.to(xs.device))
+#         if x_proj_bias is not None:
+#             x_dbl = x_dbl + x_proj_bias.view(1, K, -1, 1).to(xs.device)
+#         dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
+#         dts = torch.einsum("b k r l, k d r -> b k d l", dts, dt_projs_weight.to(dts.device))
+
+#     xs = xs.view(B, -1, L)
+#     dts = dts.contiguous().view(B, -1, L)
+#     As = -torch.exp(A_logs.to(torch.float)) # (k * c, d_state)
+#     Bs = Bs.contiguous().view(B, K, N, L)
+#     Cs = Cs.contiguous().view(B, K, N, L)
+#     Ds = Ds.to(torch.float) # (K * c)
+#     delta_bias = dt_projs_bias.view(-1).to(torch.float)
+
+#     if force_fp32:
+#         xs = xs.to(torch.float)
+#         dts = dts.to(torch.float)
+#         Bs = Bs.to(torch.float)
+#         Cs = Cs.to(torch.float)
+
+#     ys: torch.Tensor = selective_scan(
+#         xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+#     ).view(B, K, -1, H, W)
+    
+#     y: torch.Tensor = CrossMerge.apply(ys)
+
+#     if out_norm_shape in ["v1"]: # (B, C, H, W)
+#         y = out_norm(y.view(B, -1, H, W)).permute(0, 2, 3, 1) # (B, H, W, C)
+#     else: # (B, L, C)
+#         y = y.transpose(dim0=1, dim1=2).contiguous() # (B, L, C)
+#         y = out_norm(y).view(B, H, W, -1)
+
+#     return (y.to(x.dtype) if to_dtype else y)
+
 def cross_selective_scan(
     x: torch.Tensor=None, 
     x_proj_weight: torch.Tensor=None,
@@ -142,6 +240,18 @@ def cross_selective_scan(
     D, N = A_logs.shape
     K, D, R = dt_projs_weight.shape
     L = H * W
+
+    # 获取输入 x 的设备
+    device = x.device
+    
+    # 确保所有参数都在同一个设备上
+    x_proj_weight = x_proj_weight.to(device)
+    if x_proj_bias is not None:
+        x_proj_bias = x_proj_bias.to(device)
+    dt_projs_weight = dt_projs_weight.to(device)
+    dt_projs_bias = dt_projs_bias.to(device)
+    A_logs = A_logs.to(device)
+    Ds = Ds.to(device)
 
     if nrows == 0:
         if D % 4 == 0:
@@ -203,12 +313,47 @@ def cross_selective_scan(
     ).view(B, K, -1, H, W)
     
     y: torch.Tensor = CrossMerge.apply(ys)
+    # print("x device:", x.device)
+    # print("y device:", y.device)
+    # print("out_norm weight device:", out_norm.weight.device)
+    
 
     if out_norm_shape in ["v1"]: # (B, C, H, W)
-        y = out_norm(y.view(B, -1, H, W)).permute(0, 2, 3, 1) # (B, H, W, C)
+        y = y.view(B, -1, H, W)
+        # 确保 out_norm 的参数在正确的设备上
+        # 检查 out_norm 的权重是否与输入 y 在同一个设备上
+        if out_norm.weight.device != y.device:
+            # 这是一个补丁：如果设备不一致，使用 functional 的方式调用，并将权重临时移到 y 的设备上
+            from torch.nn import functional as F
+            y = F.layer_norm(
+                y, 
+                out_norm.normalized_shape, 
+                out_norm.weight.to(y.device), 
+                out_norm.bias.to(y.device), 
+                out_norm.eps
+            ).view(B, H, W, -1)
+        else:
+            # 如果设备一致，正常调用
+            y = out_norm(y).view(B, H, W, -1)        
+        # y = out_norm(y).permute(0, 2, 3, 1) # (B, H, W, C)
     else: # (B, L, C)
         y = y.transpose(dim0=1, dim1=2).contiguous() # (B, L, C)
-        y = out_norm(y).view(B, H, W, -1)
+        # 确保 out_norm 的参数在正确的设备上
+        # y = out_norm(y).view(B, H, W, -1)
+        # 检查 out_norm 的权重是否与输入 y 在同一个设备上
+        if out_norm.weight.device != y.device:
+            # 这是一个补丁：如果设备不一致，使用 functional 的方式调用，并将权重临时移到 y 的设备上
+            from torch.nn import functional as F
+            y = F.layer_norm(
+                y, 
+                out_norm.normalized_shape, 
+                out_norm.weight.to(y.device), 
+                out_norm.bias.to(y.device), 
+                out_norm.eps
+            ).view(B, H, W, -1)
+        else:
+            # 如果设备一致，正常调用
+            y = out_norm(y).view(B, H, W, -1)
 
     return (y.to(x.dtype) if to_dtype else y)
 
@@ -564,14 +709,40 @@ class SS2D(nn.Module):
         D._no_weight_decay = True
         return D
 
+    # def forward_corev2(self, x: torch.Tensor, cross_selective_scan=cross_selective_scan, **kwargs):
+    #     x_proj_weight = self.x_proj_weight
+    #     dt_projs_weight = self.dt_projs_weight
+    #     dt_projs_bias = self.dt_projs_bias
+    #     A_logs = self.A_logs
+    #     Ds = self.Ds
+    #     out_norm = getattr(self, "out_norm", None)
+    #     out_norm_shape = getattr(self, "out_norm_shape", "v0")
+
+    #     return cross_selective_scan(
+    #         x, x_proj_weight, None, dt_projs_weight, dt_projs_bias,
+    #         A_logs, Ds, delta_softplus=True,
+    #         out_norm=out_norm,
+    #         out_norm_shape=out_norm_shape,
+    #         **kwargs,
+    #     )
+
     def forward_corev2(self, x: torch.Tensor, cross_selective_scan=cross_selective_scan, **kwargs):
-        x_proj_weight = self.x_proj_weight
-        dt_projs_weight = self.dt_projs_weight
-        dt_projs_bias = self.dt_projs_bias
-        A_logs = self.A_logs
-        Ds = self.Ds
+        # 获取当前设备
+        device = x.device
+        
+        # 确保所有参数都在正确的设备上
+        x_proj_weight = self.x_proj_weight.to(device)
+        dt_projs_weight = self.dt_projs_weight.to(device)
+        dt_projs_bias = self.dt_projs_bias.to(device)
+        A_logs = self.A_logs.to(device)
+        Ds = self.Ds.to(device)
+        
         out_norm = getattr(self, "out_norm", None)
         out_norm_shape = getattr(self, "out_norm_shape", "v0")
+
+        # 如果 out_norm 是 nn.LayerNorm，确保它的参数在正确的设备上
+        if out_norm is not None:
+            out_norm = out_norm.to(device)        
 
         return cross_selective_scan(
             x, x_proj_weight, None, dt_projs_weight, dt_projs_bias,
@@ -579,7 +750,7 @@ class SS2D(nn.Module):
             out_norm=out_norm,
             out_norm_shape=out_norm_shape,
             **kwargs,
-        )
+        )    
     
     def forwardv0(self, x: torch.Tensor, SelectiveScan = SelectiveScanMamba, seq=False, force_fp32=True, **kwargs):
         x = self.in_proj(x)
@@ -654,6 +825,9 @@ class SS2D(nn.Module):
     
     def forward(self, x: torch.Tensor, **kwargs):
         with_dconv = (self.d_conv > 1)
+        # 确保输入在正确的设备上
+        device = x.device
+        self = self.to(device)        
         x = self.in_proj(x)
         if not self.disable_z:
             x, z = x.chunk(2, dim=-1) # (b, h, w, d)

@@ -1,0 +1,8 @@
+__pycache__
+bad_images.txt
+bad_images_deleted.txt
+dataset/
+checkpoint/
+compressai/
+VMamba/
+output/

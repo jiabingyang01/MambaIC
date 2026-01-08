@@ -4,15 +4,11 @@ import random
 import sys
 import logging
 import time
-import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from torch.utils.data import DataLoader
@@ -22,46 +18,14 @@ from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 
-# 假设 models 文件夹下有 MambaIC
 from models import MambaIC
+from torch.utils.tensorboard import SummaryWriter   
+import os
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic=True
+torch.backends.cudnn.benchmark=False
 
-# --- DDP Helper Functions ---
-def get_rank():
-    if not dist.is_available() or not dist.is_initialized():
-        return 0
-    return dist.get_rank()
-
-def is_main_process():
-    return get_rank() == 0
-
-def setup_ddp():
-    # 从环境变量获取本地 rank
-    if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = str(0) # Fallback for debugging
-    
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl')
-    return local_rank
-
-def cleanup_ddp():
-    dist.destroy_process_group()
-
-def reduce_mean(tensor, nprocs):
-    """
-    将所有 GPU 上的 tensor 求平均，用于 logging
-    """
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= nprocs
-    return rt
-
-# --- End DDP Helpers ---
-
-def compute_msssim_func(a, b):
+def compute_msssim(a, b):
     return ms_ssim(a, b, data_range=1.)
 
 def pad(x, p):
@@ -88,10 +52,9 @@ def crop(x, padding):
 
 def compute_psnr(a, b):
     mse = torch.mean((a - b)**2).item()
-    if mse == 0: return 100
     return -10 * math.log10(mse)
 
-def compute_msssim_db(a, b):
+def compute_msssim(a, b):
     return -10 * math.log10(1-ms_ssim(a, b, data_range=1.).item())
 
 def compute_bpp(out_net):
@@ -124,7 +87,7 @@ class RateDistortionLoss(nn.Module):
             out['psnr'] = -10 * math.log10(out["mse_loss"].item())
             out["msssim"] = ms_ssim(torch.round(output["x_hat"]*255), torch.round(target*255), data_range=255, size_average=True)
         else:
-            out['ms_ssim_loss'] = compute_msssim_db(output["x_hat"], target)
+            out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
             out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
 
         return out
@@ -132,6 +95,7 @@ class RateDistortionLoss(nn.Module):
 
 class AverageMeter:
     """Compute running average."""
+
     def __init__(self):
         self.val = 0
         self.avg = 0
@@ -145,11 +109,16 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def setup_logger(log_dir):
-    # 只在主进程设置 logger
-    if not is_main_process():
-        return
+class CustomDataParallel(nn.DataParallel):
+    """Custom DataParallel to access the module methods."""
+
+    def __getattr__(self, key):
+        try:
+            return super().__getattr__(key)
+        except AttributeError:
+            return getattr(self.module, key)
         
+def setup_logger(log_dir):
     log_formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
@@ -166,24 +135,22 @@ def setup_logger(log_dir):
 
 
 def configure_optimizers(net, args):
-    # 在 DDP 中，如果 net 是 DDP 包装的，访问参数需要用 net.module 或直接 net.named_parameters() (DDP 会处理)
-    # 但为了区分 quantiles，最好检查一下
-    
-    # 获取实际的模型（如果是 DDP 包装的）
-    base_model = net.module if hasattr(net, 'module') else net
+    """Separate parameters for the main optimizer and the auxiliary optimizer.
+    Return two optimizers"""
 
     parameters = {
         n
-        for n, p in base_model.named_parameters()
+        for n, p in net.named_parameters()
         if not n.endswith(".quantiles") and p.requires_grad
     }
     aux_parameters = {
         n
-        for n, p in base_model.named_parameters()
+        for n, p in net.named_parameters()
         if n.endswith(".quantiles") and p.requires_grad
     }
 
-    params_dict = dict(base_model.named_parameters())
+    # Make sure we don't have an intersection of parameters
+    params_dict = dict(net.named_parameters())
     inter_params = parameters & aux_parameters
     union_params = parameters | aux_parameters
 
@@ -202,176 +169,119 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse', local_rank=0
+    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse'
 ):  
+
     model.train()
-    world_size = dist.get_world_size()
+    device = next(model.parameters()).device
 
-    iterable = train_dataloader
-    if is_main_process():
-        iterable = tqdm(train_dataloader)
-
-    for i, d in enumerate(iterable):
-        d = d.to(local_rank, non_blocking=True)
-        
-        # --- 1. 主 Loss 优化 ---
+    for i, d in tqdm(enumerate(train_dataloader)):
+        d = d.to(device)
         optimizer.zero_grad()
-        # 注意：aux_optimizer 的 zero_grad 也可以放在这里，或者下面
         aux_optimizer.zero_grad()
 
         out_net = model(d)
+
         out_criterion = criterion(out_net, d)
-        
         if torch.isnan(out_criterion["loss"]):
             del out_net, out_criterion
+            torch.cuda.empty_cache()
             continue
-            
-        # 第一次 backward：DDP 会在这里同步主网络参数的梯度
         out_criterion["loss"].backward()
-        
         if clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
 
-        # --- 2. 辅助 Loss (Aux Loss) 优化 ---
-        # 关键修改：使用 model.no_sync() 上下文
-        # 这会阻止 DDP 再次尝试同步梯度，解决 "marked as ready twice" 错误
-        # 并且因为 aux_loss 在每张卡上计算结果是一样的，不需要同步，还能加速
-        with model.no_sync():
-            # 获取未封装的模型来计算 aux_loss
-            if hasattr(model, 'module'):
-                aux_loss = model.module.aux_loss()
-            else:
-                aux_loss = model.aux_loss()
-            
-            aux_loss.backward()
-            aux_optimizer.step()
+        aux_loss = model.aux_loss()
+        aux_loss.backward()
+        aux_optimizer.step()
 
-        # --- 日志打印 ---
-        if i % 50 == 0 and is_main_process():
-            # 为了日志准确，做一次 reduce (可选)
-            # 注意：在 no_sync 块外面做 reduce 是安全的
-            loss_reduced = reduce_mean(out_criterion["loss"], world_size)
-            bpp_loss_reduced = reduce_mean(out_criterion["bpp_loss"], world_size)
-            aux_loss_reduced = reduce_mean(aux_loss, world_size)
-            
+        if i % 50 == 0:
             if type == 'mse':
-                mse_loss_reduced = reduce_mean(out_criterion["mse_loss"], world_size)
                 logging.info(
                     f"Train epoch {epoch}: ["
-                    f"{i*len(d)*world_size}/{len(train_dataloader.dataset)}"
+                    f"{i*len(d)}/{len(train_dataloader.dataset)}"
                     f" ({100. * i / len(train_dataloader):.0f}%)]"
-                    f'\tLoss: {loss_reduced.item():.3f} |'
-                    f'\tMSE: {mse_loss_reduced.item():.4f} |'
-                    f'\tBpp: {bpp_loss_reduced.item():.3f} |'
-                    f"\tAux: {aux_loss_reduced.item():.2f}"
+                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
+                    f'\tMSE loss: {out_criterion["mse_loss"].item():.4f} |'
+                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f} |'
+                    f'\tPSNR: {out_criterion["psnr"]:.2f} |'
+                    f'\tMS-SSIM: {out_criterion["msssim"].item():.4f} |'
+                    f"\tAux loss: {aux_loss.item():.2f}"
                 )
             else:
                 logging.info(
                     f"Train epoch {epoch}: ["
-                    f"{i*len(d)*world_size}/{len(train_dataloader.dataset)}"
+                    f"{i*len(d)}/{len(train_dataloader.dataset)}"
                     f" ({100. * i / len(train_dataloader):.0f}%)]"
-                    f'\tLoss: {loss_reduced.item():.3f} |'
-                    f'\tBpp: {bpp_loss_reduced.item():.2f} |'
-                    f"\tAux: {aux_loss_reduced.item():.2f}"
+                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
+                    f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
+                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
+                    f"\tAux loss: {aux_loss.item():.2f}"
                 )
 
 
-def test_epoch(epoch, test_dataloader, model, criterion, type='mse', local_rank=0):
+def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
     model.eval()
     p = 128
-    world_size = dist.get_world_size()
-    
-    # 累加器
-    total_loss = 0
-    total_bpp = 0
-    total_psnr = 0
-    total_ssim = 0
-    total_aux = 0
-    count = 0
-
-    with torch.no_grad():
-        for d in test_dataloader:
-            d = d.to(local_rank, non_blocking=True)
-            count += d.size(0) # Batch size accumulation
-
-            if type == 'mse':
+    device = next(model.parameters()).device
+    if type == 'mse':
+        loss = AverageMeter()
+        bpp_loss = AverageMeter()
+        mse_loss = AverageMeter()
+        aux_loss = AverageMeter()
+        psnr = AverageMeter()
+        msssim = AverageMeter()
+        total_psnr,total_ssim, total_bpp = 0, 0, 0
+        with torch.no_grad():
+            for d in test_dataloader:
+                d = d.to(device)
                 d_padded, padding = pad(d, p)
                 out_net = model(d_padded)
                 out_net['x_hat'].clamp_(0, 1)
                 out_net["x_hat"] = crop(out_net["x_hat"], padding)
-                
-                # 计算当前 batch 的指标和
-                current_psnr = compute_psnr(d, out_net["x_hat"])
-                current_ssim = compute_msssim_func(d, out_net["x_hat"])
-                current_bpp = compute_bpp(out_net)
-                
-                total_psnr += current_psnr * d.size(0)
-                total_ssim += current_ssim * d.size(0)
-                total_bpp += current_bpp * d.size(0)
-                
-            else:
+                total_psnr+=compute_psnr(d, out_net["x_hat"])
+                total_ssim+=compute_msssim(d, out_net["x_hat"])
+                total_bpp+=compute_bpp(out_net)
+
+        logging.info(
+            f"Test epoch {epoch}: Average losses:"
+            f"\tBpp loss: {total_bpp/len(test_dataloader):.3f} |"
+            f"\tPSNR: {total_psnr/len(test_dataloader):.2f} |"
+            f"\tMS-SSIM: {total_ssim/len(test_dataloader):.4f} |"
+        )
+
+    else:
+        loss = AverageMeter()
+        bpp_loss = AverageMeter()
+        ms_ssim_loss = AverageMeter()
+        aux_loss = AverageMeter()
+
+        with torch.no_grad():
+            for d in test_dataloader:
+                d = d.to(device)
                 out_net = model(d)
                 out_criterion = criterion(out_net, d)
-                
-                if hasattr(model, 'module'):
-                    aux_val = model.module.aux_loss()
-                else:
-                    aux_val = model.aux_loss()
 
-                total_loss += out_criterion["loss"].item() * d.size(0)
-                total_bpp += out_criterion["bpp_loss"].item() * d.size(0)
-                total_aux += aux_val.item() * d.size(0)
-                # total_ssim could be added here if needed
+                aux_loss.update(model.aux_loss())
+                bpp_loss.update(out_criterion["bpp_loss"])
+                loss.update(out_criterion["loss"])
+                ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
 
-    # 将所有 GPU 的统计数据汇总
-    # 构造 Tensor 进行 all_reduce
-    if type == 'mse':
-        stats = torch.tensor([total_bpp, total_psnr, total_ssim, count], device=local_rank)
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        
-        # Unpack averaged values
-        global_count = stats[3].item()
-        avg_bpp = stats[0].item() / global_count
-        avg_psnr = stats[1].item() / global_count
-        avg_ssim = stats[2].item() / global_count
-        
-        # 作为一个综合指标用于保存模型 (越小越好)，可以用 -PSNR 或者 loss
-        avg_loss = -avg_psnr # 简单的 proxy，或者你可以重新计算 loss
-        
-        if is_main_process():
-            logging.info(
-                f"Test epoch {epoch}: Average losses:"
-                f"\tBpp loss: {avg_bpp:.3f} |"
-                f"\tPSNR: {avg_psnr:.2f} |"
-                f"\tMS-SSIM: {avg_ssim:.4f} |"
-            )
-            
-    else:
-        stats = torch.tensor([total_loss, total_bpp, total_aux, count], device=local_rank)
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        
-        global_count = stats[3].item()
-        avg_loss = stats[0].item() / global_count
-        avg_bpp = stats[1].item() / global_count
-        avg_aux = stats[2].item() / global_count
+        logging.info(
+            f"Test epoch {epoch}: Average losses:"
+            f"\tLoss: {loss.avg:.3f} |"
+            f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
+            f"\tBpp loss: {bpp_loss.avg:.2f} |"
+        )
 
-        if is_main_process():
-            logging.info(
-                f"Test epoch {epoch}: Average losses:"
-                f"\tLoss: {avg_loss:.3f} |"
-                f"\tBpp loss: {avg_bpp:.2f} |"
-                f"\tAux loss: {avg_aux:.2f} |"
-            )
-
-    return avg_loss
+    return loss.avg
 
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
-    if is_main_process():
-        torch.save(state, save_path + "checkpoint_latest.pth.tar")
-        if is_best:
-            torch.save(state, save_path + "checkpoint_best.pth.tar")
+    torch.save(state, save_path + "checkpoint_latest.pth.tar")
+    if is_best:
+        torch.save(state, save_path + "checkpoint_best.pth.tar")
 
 
 def parse_args(argv):
@@ -386,10 +296,10 @@ def parse_args(argv):
         "-d", "--dataset", type=str, required=True, help="Training dataset"
     )
     parser.add_argument(
-        "--train-dataname", type=str, required=True, help="Training dataset name"
+        "--train-dataname", type=str,required=True, help="Training dataset name"
     )
     parser.add_argument(
-        "--test-dataname", type=str, required=True, help="Testing dataset name"
+        "--test-dataname", type=str,required=True, help="Testing dataset name"
     )
 
     parser.add_argument(
@@ -410,7 +320,7 @@ def parse_args(argv):
         "-n",
         "--num-workers",
         type=int,
-        default=1, # DDP 每个进程有自己的 workers，通常需要比 DP 设小一点
+        default=20,
         help="Dataloaders threads (default: %(default)s)",
     )
     parser.add_argument(
@@ -480,80 +390,61 @@ def parse_args(argv):
 
 
 def main(argv):
-    # 1. 初始化 DDP
-    local_rank = setup_ddp()
     args = parse_args(argv)
-    
-    # 打印参数只在 rank 0
-    if is_main_process():
-        for arg in vars(args):
-            print(arg, ":", getattr(args, arg))
-    
+    for arg in vars(args):
+        print(arg, ":", getattr(args, arg))
     type = args.type
     save_path = os.path.join(args.save_path, str(args.lmbda))
-    if not os.path.exists(save_path) and is_main_process():
+    if not os.path.exists(save_path):
         os.makedirs(save_path)
-    
-    # 确保文件夹创建后再初始化 logger
-    dist.barrier() 
-    
     setup_logger(save_path + '/' + time.strftime('%Y%m%d_%H%M%S') + '.log')
-    
     if args.seed is not None:
-        # 在 DDP 中，通常希望所有进程初始化模型的权重一致，所以这里先用统一 seed
         torch.manual_seed(args.seed)
         random.seed(args.seed)
-        # 注意：DataLoader 的 shuffle 由 DistributedSampler 处理
-        # 如果 transform 中有随机性，PyTorch 的 worker 会基于 global seed 分叉，
-        # 只要保证数据不同(Sampler控制)，transform 随机性是 OK 的。
-
-    if is_main_process():
-        for k in args.__dict__:
-            logging.info(k + ':' + str(args.__dict__[k]))
+    for k in args.__dict__:
+        logging.info(k + ':' + str(args.__dict__[k]))
 
     train_transforms = transforms.Compose(
         [transforms.RandomResizedCrop(args.patch_size), transforms.ToTensor()]
     )
 
     test_transforms = transforms.Compose(
-        [transforms.ToTensor()]
+        [transforms.CenterCrop(256), transforms.ToTensor()]
     )
 
     train_dataset = ImageFolder(args.dataset, split=args.train_dataname, transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split=args.test_dataname, transform=test_transforms)
 
-    # 2. 定义 DistributedSampler
-    train_sampler = DistributedSampler(train_dataset, shuffle=True)
-    test_sampler = DistributedSampler(test_dataset, shuffle=False)
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        sampler=train_sampler, # DDP 必须使用 sampler
-        shuffle=False,         # 有 sampler 时 shuffle 必须为 False
-        pin_memory=True,
+        shuffle=True,
+        pin_memory=(device == "cuda"),
     )
 
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=args.test_batch_size,
         num_workers=args.num_workers,
-        sampler=test_sampler,
         shuffle=False,
-        pin_memory=True,
+        pin_memory=(device == "cuda"),
     )
 
     if args.depths == None:
         net = MambaIC(depths=[2,2,9,2], N=args.N, M=args.M)
     else:
         net = MambaIC(depths= args.depths, N=args.N, M=args.M)
-        
-    net = net.to(local_rank)
+    net = net.to(device)
     
-    # 3. 将模型包装为 DDP
-    # find_unused_parameters=False 通常效率更高。如果报错说有些参数没用到，改为 True
-    net = DDP(net, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    # 启用多GPU
+    if torch.cuda.device_count() > 1:
+        logging.info(f"Using {torch.cuda.device_count()} GPUs for training")
+        net = nn.DataParallel(net)
+    else:
+        logging.info("Using single GPU for training")
     
     optimizer, aux_optimizer = configure_optimizers(net, args)
     milestones = args.lr_epoch
@@ -562,33 +453,21 @@ def main(argv):
     criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
 
     last_epoch = 0
-    if args.checkpoint:
-        if is_main_process():
-            print("Loading", args.checkpoint)
-        # 加载 checkpoint 需要注意 map_location
-        checkpoint = torch.load(args.checkpoint, map_location={'cuda:0': f'cuda:{local_rank}'})
-        
-        # 处理 state_dict 的 key，如果在保存时已经是 DDP (module.xxx)，加载可以直接 load
-        # 如果保存时是普通模型，加载到 DDP 模型需要增加 module. 前缀或者不加（取决于保存方式）
-        # 这里假设保存时使用了 net.state_dict()，如果是 DDP 包装的，会有 module. 前缀
+    if args.checkpoint:  # load from previous checkpoint
+        print("Loading", args.checkpoint)
+        checkpoint = torch.load(args.checkpoint, map_location=device)
         net.load_state_dict(checkpoint["state_dict"])
-        
         if args.continue_train:
             last_epoch = checkpoint["epoch"] + 1
             optimizer.load_state_dict(checkpoint["optimizer"])
             aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            print(last_epoch)
 
     best_loss = float("inf")
-    
-    for epoch in range(last_epoch, args.epochs):
-        # 4. 每个 epoch 开始前必须设置 sampler 的 epoch，保证 shuffle 随机性不同
-        train_sampler.set_epoch(epoch)
-        
-        if is_main_process():
-            logging.info('======Current epoch %s ======'%epoch)
-            logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-            
+    for epoch in tqdm(range(last_epoch, args.epochs)):
+        logging.info('======Current epoch %s ======'%epoch)
+        logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
         train_one_epoch(
             net,
             criterion,
@@ -597,22 +476,21 @@ def main(argv):
             aux_optimizer,
             epoch,
             args.clip_max_norm,
-            type,
-            local_rank=local_rank
+            type
         )
-        
-        loss = test_epoch(epoch, test_dataloader, net, criterion, type, local_rank=local_rank)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()         
+        loss = test_epoch(epoch, test_dataloader, net, criterion, type)
         lr_scheduler.step()
 
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)
 
         if args.save:
-            # save_checkpoint 内部已经限制了只有 main_process 保存
             save_checkpoint(
                 {
                     "epoch": epoch,
-                    "state_dict": net.state_dict(), # 这里保存包含 module. 前缀
+                    "state_dict": net.state_dict(),
                     "loss": loss,
                     "optimizer": optimizer.state_dict(),
                     "aux_optimizer": aux_optimizer.state_dict(),
@@ -623,8 +501,7 @@ def main(argv):
                 save_path,
                 save_path + str(epoch) + "_checkpoint.pth.tar",
             )
-            
-    cleanup_ddp()
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])

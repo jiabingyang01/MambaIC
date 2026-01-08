@@ -347,14 +347,14 @@ class VSSBlock(nn.Module):
         
         self.drop_path = DropPath(drop_path)
 
-    def _forward(self, input: torch.Tensor):
+    def _forward(self, input: torch.Tensor):       
         if self.post_norm:
             x = input + self.drop_path(self.norm(self.op(input)))
         else:
             x = input + self.drop_path(self.op(self.norm(input)))
         return x
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor):     
         if self.use_checkpoint:
             return checkpoint.checkpoint(self._forward, input)
         else:
@@ -577,6 +577,8 @@ class MambaIC(CompressionModel):
         return half * torch.erfc(const * inputs)
 
     def forward(self, x):
+        current_device = x.device
+        self.to(current_device)        
         y = self.g_a(x)
         B, C, H, W = y.size()
         y_shape = y.shape[2:]
