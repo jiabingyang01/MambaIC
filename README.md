@@ -82,7 +82,7 @@ bash eval.sh
 Set your own test data and checkpoint by parameter *--data* and *--checkpoint*.
 
 ## Pretrained Models
-We provide a re-implementation of $\lambda$ 0.008 [0.008checkpoint_best.pth.tar](https://huggingface.co/AuroraZengfh/MambaIC) for quick evaluation. Performance may vary slightly due to hardware and code differences.
+We provide a re-implementation of $\lambda$ 0.008 [0.008checkpoint_best.pth.tar](https://huggingface.co/yangjiabing01/MambaIC-Wildfire) for quick evaluation. Performance may vary slightly due to hardware and code differences.
 
 ## Experimental Results
 
