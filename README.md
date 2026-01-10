@@ -1,6 +1,6 @@
 # MambaIC: State Space Models for High-Performance Learned Image Compression (CVPR 2025)
 
-This repository is a **re-implementation/reproduction** CVPR 2025 paper: [**MambaIC: State Space Models for High-Performance Learned Image Compression**](https://arxiv.org/abs/2503.12461)
+This repository is a **re-implementation/reproduction** of the CVPR 2025 paper: [**MambaIC: State Space Models for High-Performance Learned Image Compression**](https://arxiv.org/abs/2503.12461).
 
 > MambaIC: State Space Models for High-Performance Learned Image Compression
 >
@@ -25,7 +25,17 @@ Illustration of the proposed SSM-based context entropy model with window-based l
 
 ![context](figures/context.png)
 
-## Environmental Setup
+## Getting Started
+### Environmental Setup
+```
+git clone https://github.com/jiabingyang01/MambaIC.git
+conda create -n MambaIC python=3.10 -y
+conda activate MambaIC
+pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+cd MambaIC
+pip install -r requirements.txt
+```
+
 ### Install CompressAI
 ```
 git clone https://github.com/InterDigitalInc/CompressAI compressai
@@ -35,9 +45,11 @@ pip install -U pip && pip install -e .
 
 ### Install Vmamba
 ```
+cd ..
 git clone https://github.com/MzeroMiko/VMamba.git
 cd VMamba
-cd kernels/selective_scan && pip install .
+cd kernels/selective_scan
+pip install . --no-build-isolation
 ```
 ### Dataset
 
@@ -65,20 +77,20 @@ MambaIC
 ###
 
 ## Training 
-Our default training dataset is [Flickr30k](https://shannon.cs.illinois.edu/DenotationGraph/) (30k images), you can also try to train the model on larger datasets like OpenImages dataset (first 400K images)
+We train the model with our wildfire dataset (11k), you can also try to train the model on larger datasets like OpenImages dataset (first 400K images)
 ```
-sh train.sh
+bash train.sh
 ```
 Remember to replace *save-path*, *train-dataname* and *test-dataname* in the script with your own path.
 
 ## Evaluation
 ```
-sh eval.sh
+bash eval.sh
 ```
 Set your own test data and checkpoint by parameter *--data* and *--checkpoint*.
 
 ## Pretrained Models
-We provide a re-implementation of $\lambda$ 0.025 [checkpoint0.025.pth.tar](https://huggingface.co/AuroraZengfh/MambaIC) for quick evaluation. Performance may vary slightly due to hardware and code differences.
+We provide a re-implementation of $\lambda$ 0.008 [0.008checkpoint_best.pth.tar](https://huggingface.co/AuroraZengfh/MambaIC) for quick evaluation. Performance may vary slightly due to hardware and code differences.
 
 ## Experimental Results
 
@@ -86,10 +98,10 @@ Quantitative RD Results on Kodak (*left*: PSNR, *Right*: MS-SSIM).
 
 ![results](figures/results.png)
 
-## Note
+<!-- ## Note
 1. This is not the exact original code and is a re-implementation of our CVPR 2025 paper. But the core code and experimental results are almost the same, with slight difference and acceptable experimental deviation.
 
-2. This is to make a clear clarification that, unlike previous works that use $\times$ 12.7 larger OpenImages (400k) as training dataset, we use Flickr30k (30k), which may cause some misunderstandings in BD-rate between original papers and our paper. 
+2. This is to make a clear clarification that, unlike previous works that use $\times$ 12.7 larger OpenImages (400k) as training dataset, we use Flickr30k (30k), which may cause some misunderstandings in BD-rate between original papers and our paper.  -->
 
 ## :blue_book: Citation
 If you find this work useful, consider giving this repository a star :star: and citing :bookmark_tabs: our paper as follows:

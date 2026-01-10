@@ -1,6 +1,7 @@
-compressai
-torch=2.1.0
 einops
-mamba-ssm
+# mamba-ssm
 timm
 tqdm
+pytorch_msssim
+numpy==1.26.4
+tensorboard

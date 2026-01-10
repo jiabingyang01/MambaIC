@@ -37,6 +37,7 @@ def parse_args(argv):
     parser.add_argument("--cuda", action="store_true", help="Use cuda")
     parser.add_argument("--data", type=str, required=True, help="Path to dataset")
     parser.add_argument("--quality", type=int, default=75, help="JPEG Quality (1-95)")
+    parser.add_argument("--output_dir", type=str, required=True, help="Path to output directory")
     args = parser.parse_args(argv)
     return args
 
@@ -81,8 +82,8 @@ def main(argv):
         print(f"Error: Path {path} not found.")
         return
 
-    output_root = "/home/zhaorun/zichen/yjb/projects/CV/MambaIC/output/JPEG"
-    output_dir = os.path.join(output_root, str(args.quality))
+    # output_root = "/DATA/disk0/yjb/projects/CV/MambaIC/output/JPEG"
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     for file in os.listdir(path):

@@ -1,2 +1,2 @@
-# CUDA_VISIBLE_DEVICES=0 python eval.py --cuda --data dataset/wildfire/all --lambda 0.008 --output_dir output/MambaIC/0.008/all --checkpoint checkpoint/wildfire/0.008checkpoint_best.pth.tar
-CUDA_VISIBLE_DEVICES=0 python eval_jpeg.py --data /home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset/wildfire/all --cuda --quality 10
+CUDA_VISIBLE_DEVICES=0 python eval.py --cuda --data dataset/wildfire/smoke --lambda 0.008 --output_dir output/MambaIC/0.008/smoke --checkpoint checkpoint/wildfire/0.008checkpoint_best.pth.tar
+# CUDA_VISIBLE_DEVICES=0 python eval_jpeg.py --cuda --data dataset/wildfire/all --quality 20 --output_dir output/JPEG/20/all

@@ -6,3 +6,4 @@ checkpoint/*
 compressai/
 VMamba/
 output/*
+hf_push.py
