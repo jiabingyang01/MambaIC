@@ -1,7 +1,7 @@
 import os
 from PIL import Image
 
-root = "/home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset/wildfire/train"
+root = "/home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset/train"
 
 bad_images = []
 

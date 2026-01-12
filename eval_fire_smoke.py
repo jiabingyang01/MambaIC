@@ -128,7 +128,7 @@ def parse_args():
         help="HF repo ID to download best.pt if --model not set.",
     )
     parser.add_argument("--hf-filename", type=str, default="best.pt", help="HF filename.")
-    parser.add_argument("--original", type=str, default="/home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset/wildfire/all")
+    parser.add_argument("--original", type=str, default="/home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset/all")
     parser.add_argument("--jpeg", type=str, default="/home/zhaorun/zichen/yjb/projects/CV/MambaIC/output/JPEG/10")
     parser.add_argument("--mambaic", type=str, default="/home/zhaorun/zichen/yjb/projects/CV/MambaIC/output/MambaIC/0.008/all")
     parser.add_argument("--imgsz", type=int, default=640, help="Inference image size.")

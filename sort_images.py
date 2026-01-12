@@ -5,7 +5,7 @@ from pathlib import Path
 def sort_images_by_reference():
     # ================= 配置路径 =================
     # 1. 参考数据集的基础路径 (读取图片名的地方)
-    dataset_base_dir = "/home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset/wildfire"
+    dataset_base_dir = "/home/zhaorun/zichen/yjb/projects/CV/MambaIC/dataset"
     
     # 2. 混杂在一起的源图片路径 (MambaIC生成的所有图)
     source_img_dir = "/home/zhaorun/zichen/yjb/projects/CV/MambaIC/output/MambaIC/0.008/all"
